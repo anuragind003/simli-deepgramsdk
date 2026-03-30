@@ -52,11 +52,11 @@ const Demo: React.FC = () => {
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-4">
               <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-600 shadow-sm">
-                <span className="text-xl font-semibold text-white">A</span>
+                <span className="text-xl font-semibold text-white">S</span>
               </div>
               <div>
                 <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
-                  Ambilio Agent
+                  Simli Agent
                 </h1>
                 <p className="mt-1 text-sm text-slate-500 font-medium">
                   Intelligent Voice Interaction
@@ -266,7 +266,7 @@ const Demo: React.FC = () => {
 
           <footer className="mt-12 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/5 px-6 py-5 text-xs text-white/60">
             <span>
-              © {new Date().getFullYear()} Ambilio. Built for modern voice AI
+              © {new Date().getFullYear()} Simli. Built for modern voice AI
               experiences.
             </span>
             <span className="flex items-center gap-2">

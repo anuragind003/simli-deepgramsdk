@@ -1,4 +1,4 @@
-# Ambilio Agent App (Simli-Deepgram SDK)
+# Simli Agent App (Simli-Deepgram SDK)
 
 A clean, minimalistic conversational AI interface powered by **Simli**, **Deepgram**, and **OpenAI**. This version uses manual orchestration for full control over the AI pipeline (STT -> LLM -> TTS).
 

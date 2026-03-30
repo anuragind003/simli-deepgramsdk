@@ -6,8 +6,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Ambilio Agent Interface",
-  description: "Enterprise Conversational AI powered by Ambilio.",
+  title: "Simli Agent Interface",
+  description: "Enterprise Conversational AI powered by Simli.",
 };
 
 export default function RootLayout({
