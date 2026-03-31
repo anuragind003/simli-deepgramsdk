@@ -29,12 +29,58 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "",
 });
 
-let currentOpenAIStream: {
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful virtual assistant. Keep responses concise and conversational.";
+const MAX_HISTORY_MESSAGES = 20;
+
+type OpenAIStreamState = {
   stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
   controller: AbortController;
-} | null = null;
+};
 
-const connections = new Map();
+type ConnectionState = {
+  prompt: string;
+  voiceId: string;
+  ws?: WebSocket;
+  deepgram?: {
+    send: (data: any) => void;
+    getReadyState: () => number;
+    keepAlive: () => void;
+    removeAllListeners: () => void;
+  };
+  currentOpenAIStream: OpenAIStreamState | null;
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+};
+
+const connections = new Map<string, ConnectionState>();
+
+const trimConversationHistory = (
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+) => {
+  if (messages.length <= MAX_HISTORY_MESSAGES) {
+    return messages;
+  }
+
+  const [system, ...rest] = messages;
+  if (!system) {
+    return messages.slice(-MAX_HISTORY_MESSAGES);
+  }
+
+  return [system, ...rest.slice(-(MAX_HISTORY_MESSAGES - 1))];
+};
+
+const interruptCurrentStream = (connectionId: string, ws: WebSocket) => {
+  const connection = connections.get(connectionId);
+  if (!connection?.currentOpenAIStream) {
+    return;
+  }
+
+  console.log(`Interrupting current stream (ID: ${connectionId})`);
+  connection.currentOpenAIStream.controller.abort();
+  connection.currentOpenAIStream = null;
+  ws.send(JSON.stringify({ type: "interrupt" }));
+};
+
 app.post("/start-conversation", (req: any, res: any) => {
   const { prompt, voiceId } = req.body as { prompt: string; voiceId: string };
   if (!prompt || !voiceId) {
@@ -52,8 +98,15 @@ app.post("/start-conversation", (req: any, res: any) => {
       .json({ error: "API key invalid: " + validate.errors });
   }
 
+  const systemPrompt = prompt.trim() || DEFAULT_SYSTEM_PROMPT;
   const connectionId = Date.now().toString();
-  connections.set(connectionId, { prompt, voiceId });
+  connections.set(connectionId, {
+    prompt: systemPrompt,
+    voiceId,
+    currentOpenAIStream: null,
+    messages: [{ role: "system", content: systemPrompt }],
+  });
+
   res.json({
     connectionId,
     message: "Conversation started. Connect to WebSocket to continue.",
@@ -71,7 +124,9 @@ server.on("upgrade", (request, socket, head) => {
   const { pathname, query } = url.parse(request.url, true);
 
   if (pathname === "/ws") {
-    const connectionId = query.connectionId;
+    const connectionId =
+      typeof query.connectionId === "string" ? query.connectionId : undefined;
+
     if (!connectionId || !connections.has(connectionId)) {
       socket.destroy();
       return;
@@ -79,6 +134,11 @@ server.on("upgrade", (request, socket, head) => {
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       const connection = connections.get(connectionId);
+      if (!connection) {
+        socket.destroy();
+        return;
+      }
+
       console.log(`WebSocket: Client connected (ID: ${connectionId})`);
       setupWebSocket(ws, connection.prompt, connection.voiceId, connectionId);
     });
@@ -93,13 +153,12 @@ const setupWebSocket = (
   ws: WebSocket,
   initialPrompt: string,
   voiceId: string,
-  connectionId: string | string[],
+  connectionId: string,
 ) => {
   let isFinals: string[] = [];
   let audioQueue: any[] = [];
   let keepAlive: NodeJS.Timeout;
   let userSpeakingNotified = false;
-  currentOpenAIStream = null;
 
   const deepgram = deepgramClient.listen.live({
     model: "nova-2",
@@ -148,14 +207,9 @@ const setupWebSocket = (
           `Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`,
         );
 
-        if (currentOpenAIStream) {
-          console.log("Interrupting current stream");
-          currentOpenAIStream.controller.abort();
-          currentOpenAIStream = null;
-          ws.send(JSON.stringify({ type: "interrupt" }));
-        }
+        interruptCurrentStream(connectionId, ws);
 
-        promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+        promptLLM(ws, utterance, connectionId);
       }
     }
   });
@@ -165,20 +219,15 @@ const setupWebSocket = (
       const utterance = isFinals.join(" ");
       isFinals = [];
       userSpeakingNotified = false;
-      initialPrompt = "";
 
       ws.send(JSON.stringify({ type: "userTranscript", content: utterance }));
       console.log(
         `Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`,
       );
 
-      if (currentOpenAIStream) {
-        currentOpenAIStream.controller.abort();
-        currentOpenAIStream = null;
-        ws.send(JSON.stringify({ type: "interrupt" }));
-      }
+      interruptCurrentStream(connectionId, ws);
 
-      promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+      promptLLM(ws, utterance, connectionId);
     }
   });
 
@@ -204,6 +253,13 @@ const setupWebSocket = (
   ws.on("close", () => {
     console.log(`WebSocket: Client disconnected (ID: ${connectionId})`);
     clearInterval(keepAlive);
+
+    const connection = connections.get(connectionId);
+    if (connection?.currentOpenAIStream) {
+      connection.currentOpenAIStream.controller.abort();
+      connection.currentOpenAIStream = null;
+    }
+
     deepgram.removeAllListeners();
     connections.delete(connectionId);
   });
@@ -212,44 +268,44 @@ const setupWebSocket = (
     deepgram.keepAlive();
   }, 5_000);
 
+  const existingConnection = connections.get(connectionId);
+  if (!existingConnection) {
+    ws.close();
+    deepgram.removeAllListeners();
+    return;
+  }
+
   connections.set(connectionId, {
-    ...connections.get(connectionId),
+    ...existingConnection,
     ws,
     deepgram,
   });
 };
 
-async function promptLLM(
-  ws: WebSocket,
-  initialPrompt: string,
-  prompt: string,
-  voiceId: string,
-  connectionId: string | string[],
-) {
+async function promptLLM(ws: WebSocket, prompt: string, connectionId: string) {
+  const connection = connections.get(connectionId);
+  if (!connection) {
+    return;
+  }
+
   try {
+    connection.messages.push({ role: "user", content: prompt });
+    connection.messages = trimConversationHistory(connection.messages);
+
     const controller = new AbortController();
     const stream = await openai.chat.completions.create(
       {
         model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "assistant",
-            content: initialPrompt,
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        messages: connection.messages,
         temperature: 1,
-        max_tokens: 50,
+        max_tokens: 120,
         top_p: 1,
         stream: true,
       },
       { signal: controller.signal },
     );
 
-    currentOpenAIStream = { stream, controller };
+    connection.currentOpenAIStream = { stream, controller };
 
     let fullResponse = "";
     let deepgramTtsWs: WebSocket | undefined;
@@ -277,7 +333,7 @@ async function promptLLM(
         if (!deepgramTtsWs) {
           deepgramTtsWs = await startDeepgramTtsStreaming(
             ws,
-            voiceId,
+            connection.voiceId,
             connectionId,
           );
         }
@@ -302,12 +358,18 @@ async function promptLLM(
       }
     }
 
-    currentOpenAIStream = null;
+    connection.currentOpenAIStream = null;
+
+    if (fullResponse.trim()) {
+      connection.messages.push({ role: "assistant", content: fullResponse });
+      connection.messages = trimConversationHistory(connection.messages);
+    }
 
     if (deepgramTtsWs) {
       deepgramTtsWs.send(JSON.stringify({ type: "Flush" }));
     }
   } catch (error) {
+    connection.currentOpenAIStream = null;
     console.error(`Error in promptLLM (ID: ${connectionId}):`, error);
     ws.send(JSON.stringify({ type: "error", error: String(error) }));
   }
@@ -316,7 +378,7 @@ async function promptLLM(
 async function startDeepgramTtsStreaming(
   ws: WebSocket,
   voiceId: string,
-  connectionId: string | string[],
+  connectionId: string,
 ) {
   return new Promise<WebSocket>((resolve, reject) => {
     const deepgramTtsWs = new WebSocket(
